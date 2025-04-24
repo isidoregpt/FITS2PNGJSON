@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
 import os
 import json
 import numpy as np
+import shutil
 from astropy.io import fits
 from astropy.time import Time
 from astropy.visualization import astropy_mpl_style, ZScaleInterval
@@ -93,8 +93,7 @@ st.set_page_config(
 )
 
 st.title("🔭 FITS → PNG & JSON Converter")
-st.markdown(
-    """
+st.markdown("""
 This tool transforms astronomical FITS files into:
 1. **PNG** images (z-scaled, publication-quality).  
 2. **JSON** metadata (headers, comments, timestamps, sun parameters, basic stats).
@@ -103,9 +102,8 @@ This tool transforms astronomical FITS files into:
 - **Upload** one or more `.fit` or `.fits` files below.  
 - **(Optional)** Change the output directory in the sidebar.  
 - Click **Convert** and watch the progress bar.  
-- Your `.png` and `.json` files will appear in the chosen folder.
-"""
-)
+- Download your results as a ZIP or inspect the individual files in the output folder.
+""")
 
 # Sidebar settings
 st.sidebar.header("⚙️ Settings")
@@ -157,7 +155,20 @@ if uploaded:
 
             progress.progress(i / total)
 
+        # ZIP & download
+        zip_base = os.path.join(output_dir, "converted")
+        shutil.make_archive(base_name=zip_base, format="zip", root_dir=output_dir)
+        zip_path = zip_base + ".zip"
+        with open(zip_path, "rb") as f:
+            st.download_button(
+                label="📦 Download all results as ZIP",
+                data=f,
+                file_name="fits_converted_results.zip",
+                mime="application/zip"
+            )
+
         st.balloons()
-        st.success(f"All done! Files written to:\n`{output_dir}`")
+        st.success(f"Conversion complete! Files written to:\n`{output_dir}`")
 else:
     st.info("Upload FITS files to get started.")
+
