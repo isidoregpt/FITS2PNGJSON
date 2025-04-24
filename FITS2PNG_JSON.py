@@ -1,131 +1,163 @@
-import streamlit as st
-import numpy as np
+#!/usr/bin/env python3
+import os
 import json
-import io
-import zipfile
+import numpy as np
 from astropy.io import fits
 from astropy.time import Time
 from astropy.visualization import astropy_mpl_style, ZScaleInterval
 import matplotlib.pyplot as plt
+import streamlit as st
 
-st.set_page_config(page_title="FITS → PNG+JSON Converter", layout="wide")
-st.title("☀️ FITS to PNG + JSON Converter")
+# ——— Utility functions (ported from your script) ———
+
+def header_to_dict(header):
+    d = {}
+    for card in header.cards:
+        key = card.keyword
+        if not key or key in ("COMMENT", "HISTORY"):
+            continue
+        val = card.value
+        if isinstance(val, np.generic):
+            val = val.item()
+        d[key] = val
+    return d
+
+def extract_comments(header):
+    comments = {}
+    for card in header.cards:
+        if card.keyword and card.comment:
+            comments[card.keyword] = card.comment
+    return comments
+
+def extract_metadata(header, data):
+    meta = {}
+    meta["header"] = header_to_dict(header)
+    comm = extract_comments(header)
+    if comm:
+        meta["header_comments"] = comm
+
+    # observation time
+    for k in ("DATE-OBS", "DATE_OBS", "DATE", "OBSDATE"):
+        if k in header:
+            try:
+                meta["observation_time"] = Time(header[k]).iso
+                break
+            except Exception:
+                pass
+
+    # solar-disk params
+    sun_keys = ("FNDLMBXC", "FNDLMBYC", "FNDLMBMI", "FNDLMBMA")
+    if all(k in header for k in sun_keys):
+        try:
+            cx = float(header["FNDLMBXC"])
+            cy = float(header["FNDLMBYC"])
+            minor = float(header["FNDLMBMI"])
+            major = float(header["FNDLMBMA"])
+            meta["sun_params"] = {
+                "cx": cx,
+                "cy": cy,
+                "radius": (minor + major) / 4.0
+            }
+        except Exception:
+            pass
+    if "sun_params" not in meta:
+        h, w = data.shape
+        meta["sun_params"] = {"cx": w/2.0, "cy": h/2.0, "radius": min(w, h)*0.45}
+
+    meta["data_shape"] = list(data.shape)
+    meta["dtype"] = str(data.dtype)
+    meta["data_stats"] = {
+        "min": float(np.min(data)),
+        "max": float(np.max(data)),
+        "mean": float(np.mean(data)),
+        "median": float(np.median(data)),
+        "std": float(np.std(data)),
+    }
+    return meta
+
+def render_png(data, out_path, dpi=300, figsize=(8, 8)):
+    plt.style.use(astropy_mpl_style)
+    fig = plt.figure(figsize=figsize, dpi=dpi)
+    vmin, vmax = ZScaleInterval().get_limits(data)
+    plt.imshow(data, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
+    plt.axis("off")
+    plt.tight_layout(pad=0)
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+
+# ——— Streamlit UI ———
+
+st.set_page_config(
+    page_title="FITS → PNG/JSON Converter",
+    layout="wide",
+)
+
+st.title("🔭 FITS → PNG & JSON Converter")
 st.markdown(
     """
-    Upload `.fit` or `.fits` files.  
-    This app will:
-    1. Read each FITS file, replacing NaNs  
-    2. Extract **all** header cards + observation time + solar parameters  
-    3. Compute basic data stats (min/max/mean/median/std/dtype)  
-    4. Render a grayscale PNG via z‐scale  
-    5. Bundle each PNG + metadata JSON into a ZIP for download  
-    """
+This tool transforms astronomical FITS files into:
+1. **PNG** images (z-scaled, publication-quality).  
+2. **JSON** metadata (headers, comments, timestamps, sun parameters, basic stats).
+
+**Steps to use:**
+- **Upload** one or more `.fit` or `.fits` files below.  
+- **(Optional)** Change the output directory in the sidebar.  
+- Click **Convert** and watch the progress bar.  
+- Your `.png` and `.json` files will appear in the chosen folder.
+"""
 )
 
-uploads = st.file_uploader(
-    "Upload FITS files", type=["fit", "fits"], accept_multiple_files=True
+# Sidebar settings
+st.sidebar.header("⚙️ Settings")
+default_out = os.path.abspath("Output")
+output_dir = st.sidebar.text_input("Output directory", value=default_out)
+if not os.path.exists(output_dir):
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except Exception as e:
+        st.sidebar.error(f"Could not create folder: {e}")
+
+# File uploader
+uploaded = st.file_uploader(
+    "Upload FITS files",
+    type=["fit", "fits"],
+    accept_multiple_files=True
 )
 
-if uploads and st.button("▶️ Convert all"):
-    with st.spinner("Processing…"):
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
-            for u in uploads:
-                name = u.name.rsplit(".", 1)[0]
+# Convert button
+if uploaded:
+    if st.button("▶️ Convert"):
+        total = len(uploaded)
+        progress = st.progress(0)
+        status = st.empty()
 
-                # --- Read FITS ---
-                hdul = fits.open(u)
-                data = hdul[0].data
+        for i, file in enumerate(uploaded, start=1):
+            fname = file.name
+            status.text(f"Processing **{fname}** ({i}/{total})…")
+            try:
+                hdul = fits.open(file)
+                data = np.nan_to_num(hdul[0].data)
                 header = hdul[0].header
                 hdul.close()
-                data = np.nan_to_num(data)
 
-                # --- Build metadata ---
-                metadata = {}
+                # metadata + rendering
+                meta = extract_metadata(header, data)
+                name, _ = os.path.splitext(fname)
 
-                # 1) Dump entire header
-                header_dict = {}
-                for key in header.keys():
-                    # Card values may be numpy types—cast to native
-                    val = header[key]
-                    try:
-                        header_dict[key] = val.tolist() if hasattr(val, "tolist") else val
-                    except:
-                        header_dict[key] = str(val)
-                metadata["header"] = header_dict
+                png_path = os.path.join(output_dir, f"{name}.png")
+                render_png(data, png_path)
 
-                # 2) Observation time
-                for k in ("DATE-OBS", "DATE_OBS", "DATE", "OBSDATE"):
-                    if k in header:
-                        try:
-                            metadata["observation_time"] = Time(header[k]).iso
-                            break
-                        except:
-                            pass
+                json_path = os.path.join(output_dir, f"{name}.json")
+                with open(json_path, "w") as jf:
+                    json.dump(meta, jf, indent=2)
 
-                # 3) Solar parameters
-                sun_keys = ("FNDLMBXC", "FNDLMBYC", "FNDLMBMI", "FNDLMBMA")
-                if all(k in header for k in sun_keys):
-                    try:
-                        cx = float(header["FNDLMBXC"])
-                        cy = float(header["FNDLMBYC"])
-                        minor = float(header["FNDLMBMI"])
-                        major = float(header["FNDLMBMA"])
-                        radius = (minor + major) / 4
-                        metadata["sun_params"] = {"cx": cx, "cy": cy, "radius": radius}
-                    except:
-                        pass
-                if "sun_params" not in metadata:
-                    h, w = data.shape
-                    metadata["sun_params"] = {
-                        "cx": w/2, "cy": h/2, "radius": min(w, h) * 0.45
-                    }
+                status.success(f"✔ {fname} → `{name}.png` + `{name}.json`")
+            except Exception as e:
+                status.error(f"✖ Error on {fname}: {e}")
 
-                # 4) Dimensions & dtype
-                h, w = data.shape
-                metadata["width"] = w
-                metadata["height"] = h
-                metadata["dtype"] = str(data.dtype)
+            progress.progress(i / total)
 
-                # 5) Basic statistics
-                metadata["data_stats"] = {
-                    "min": float(np.min(data)),
-                    "max": float(np.max(data)),
-                    "mean": float(np.mean(data)),
-                    "median": float(np.median(data)),
-                    "std": float(np.std(data))
-                }
-
-                # --- Render PNG ---
-                plt.style.use(astropy_mpl_style)
-                fig = plt.figure(figsize=(6, 6), dpi=150)
-                vmin, vmax = ZScaleInterval().get_limits(data)
-                plt.imshow(data, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
-                plt.axis("off")
-                buf = io.BytesIO()
-                fig.savefig(buf, bbox_inches="tight", pad_inches=0)
-                plt.close(fig)
-                buf.seek(0)
-
-                # --- Write into ZIP ---
-                zipf.writestr(f"{name}.png", buf.read())
-                zipf.writestr(f"{name}.json", json.dumps(metadata, indent=2).encode("utf-8"))
-
-        zip_buffer.seek(0)
-        st.success("Conversion complete!")
-        st.download_button(
-            "📦 Download PNG+JSON ZIP",
-            zip_buffer,
-            "fits_converted.zip",
-            mime="application/zip"
-        )
-
-    # Inline previews & JSON
-    st.header("Previews & Metadata")
-    zip_data = zip_buffer.getvalue()
-    with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-        for u in uploads:
-            name = u.name.rsplit(".", 1)[0]
-            st.subheader(name)
-            st.image(zf.read(f"{name}.png"), use_column_width=True)
-            st.json(json.loads(zf.read(f"{name}.json").decode()))
+        st.balloons()
+        st.success(f"All done! Files written to:\n`{output_dir}`")
+else:
+    st.info("Upload FITS files to get started.")
